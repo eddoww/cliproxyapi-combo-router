@@ -58,7 +58,7 @@ func retryableError(err error, status int) bool {
 		return true
 	}
 	if err == nil {
-		return false
+		return status == 0
 	}
 	message := strings.ToLower(err.Error())
 	for _, marker := range []string{
@@ -72,7 +72,9 @@ func retryableError(err error, status int) bool {
 			return true
 		}
 	}
-	return false
+	// A statusless failure is a transport or bridge problem, not a verdict on
+	// the request; let the next member try.
+	return status == 0
 }
 
 // errorEnvelopeStatus preserves the upstream HTTP status for the host so the
@@ -169,8 +171,9 @@ func executeCombo(raw []byte) ([]byte, error) {
 		}
 		if resp.StatusCode >= 400 {
 			lastStatus = resp.StatusCode
-			lastErr = fmt.Errorf("%s: upstream status %d", member, resp.StatusCode)
-			if retryableStatus(resp.StatusCode) {
+			bodyText := strings.TrimSpace(string(resp.Body))
+			lastErr = fmt.Errorf("%s: upstream status %d: %s", member, resp.StatusCode, bodyText)
+			if retryableError(lastErr, resp.StatusCode) {
 				continue
 			}
 			message := strings.TrimSpace(string(resp.Body))

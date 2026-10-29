@@ -249,95 +249,142 @@ func streamMember(hostCallbackID, pluginStreamID, format, member string, body []
 }
 
 // hasRealContent reports whether an SSE chunk carries actual model output rather
-// than protocol framing. Unknown shapes count as content so nothing is dropped
-// by accident.
+// than protocol framing. Only a strict allowlist of empty shapes counts as
+// framing; anything unrecognised is treated as content so nothing is dropped.
 func hasRealContent(payload []byte) bool {
 	text := strings.TrimSpace(string(payload))
 	if text == "" {
 		return false
 	}
-	sawData := false
+	sawSSE := false
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
+		if line == "" {
 			continue
 		}
-		sawData = true
-		dataText := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if dataText == "" || dataText == "[DONE]" {
-			continue
-		}
-		var event map[string]json.RawMessage
-		if errUnmarshal := json.Unmarshal([]byte(dataText), &event); errUnmarshal != nil {
-			return true
-		}
-		if eventHasContent(event) {
+		switch {
+		case strings.HasPrefix(line, "data:"):
+			sawSSE = true
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "" || data == "[DONE]" {
+				continue
+			}
+			var event map[string]json.RawMessage
+			if errUnmarshal := json.Unmarshal([]byte(data), &event); errUnmarshal != nil {
+				return true
+			}
+			if !isFramingEvent(event) {
+				return true
+			}
+		case strings.HasPrefix(line, "event:"), strings.HasPrefix(line, "id:"), strings.HasPrefix(line, ":"):
+			sawSSE = true
+		default:
+			// Plain (non-SSE) body: forward it.
 			return true
 		}
 	}
-	// Non-SSE payloads (or SSE without data lines) are forwarded as content.
-	return !sawData
+	return !sawSSE
 }
 
-func eventHasContent(event map[string]json.RawMessage) bool {
-	// OpenAI chat: choices[].delta with anything beyond role.
+// isFramingEvent returns true only for events that carry no model output.
+func isFramingEvent(event map[string]json.RawMessage) bool {
 	if rawChoices, ok := event["choices"]; ok {
 		var choices []map[string]json.RawMessage
 		if errUnmarshal := json.Unmarshal(rawChoices, &choices); errUnmarshal == nil {
 			for _, choice := range choices {
 				if rawDelta, okDelta := choice["delta"]; okDelta {
 					var delta map[string]json.RawMessage
-					if errUnmarshal := json.Unmarshal(rawDelta, &delta); errUnmarshal == nil {
-						for key := range delta {
-							if key != "role" {
-								return true
-							}
-						}
+					if errUnmarshal := json.Unmarshal(rawDelta, &delta); errUnmarshal == nil && deltaHasContent(delta) {
+						return false
 					}
 				}
-				if rawMessage, okMessage := choice["message"]; okMessage && len(rawMessage) > 2 {
-					return true
+				if rawMessage, okMessage := choice["message"]; okMessage {
+					var message map[string]json.RawMessage
+					if errUnmarshal := json.Unmarshal(rawMessage, &message); errUnmarshal == nil && objectHasContent(message) {
+						return false
+					}
 				}
 			}
 		}
-	}
-	// OpenAI Responses and Claude deltas.
-	if rawDelta, ok := event["delta"]; ok {
-		var deltaText string
-		if errUnmarshal := json.Unmarshal(rawDelta, &deltaText); errUnmarshal == nil {
-			if strings.TrimSpace(deltaText) != "" {
-				return true
-			}
-		} else {
-			var deltaObject map[string]json.RawMessage
-			if errUnmarshal := json.Unmarshal(rawDelta, &deltaObject); errUnmarshal == nil {
-				if objectHasContent(deltaObject) {
-					return true
-				}
-			} else {
-				return true
-			}
-		}
-	}
-	if objectHasContent(event) {
 		return true
 	}
-	// Responses tool/answer items.
-	if rawOutput, ok := event["output"]; ok {
-		var output []json.RawMessage
-		if errUnmarshal := json.Unmarshal(rawOutput, &output); errUnmarshal == nil && len(output) > 0 {
-			return true
+
+	switch strings.ToLower(jsonString(event["type"])) {
+	case "ping", "message_start", "message_stop", "message_delta", "content_block_stop",
+		"response.created", "response.in_progress", "response.queued", "response.output_item.done":
+		return true
+	case "content_block_start":
+		if raw, ok := event["content_block"]; ok {
+			var block map[string]json.RawMessage
+			if errUnmarshal := json.Unmarshal(raw, &block); errUnmarshal == nil {
+				if strings.ToLower(jsonString(block["type"])) == "tool_use" {
+					return false
+				}
+				if objectHasContent(block) {
+					return false
+				}
+			}
 		}
+		return true
+	case "content_block_delta", "response.output_text.delta", "response.function_call_arguments.delta",
+		"response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		if raw, ok := event["delta"]; ok {
+			var asText string
+			if errUnmarshal := json.Unmarshal(raw, &asText); errUnmarshal == nil {
+				return strings.TrimSpace(asText) == ""
+			}
+			var delta map[string]json.RawMessage
+			if errUnmarshal := json.Unmarshal(raw, &delta); errUnmarshal == nil {
+				return !objectHasContent(delta)
+			}
+		}
+		return true
+	case "response.output_item.added":
+		if raw, ok := event["item"]; ok {
+			var item map[string]json.RawMessage
+			if errUnmarshal := json.Unmarshal(raw, &item); errUnmarshal == nil {
+				if objectHasContent(item) {
+					return false
+				}
+			}
+		}
+		return true
+	case "":
+		// Untyped shape (Gemini chunks and friends): non-empty means content.
+		return len(event) == 0
+	default:
+		return false
 	}
-	if rawItem, ok := event["item"]; ok && len(rawItem) > 2 {
+}
+
+// deltaHasContent ignores the role marker and empty containers.
+func deltaHasContent(delta map[string]json.RawMessage) bool {
+	for key, raw := range delta {
+		if key == "role" {
+			continue
+		}
+		var asText string
+		if errUnmarshal := json.Unmarshal(raw, &asText); errUnmarshal == nil {
+			if strings.TrimSpace(asText) != "" {
+				return true
+			}
+			continue
+		}
+		trimmed := strings.TrimSpace(string(raw))
+		if trimmed == "" || trimmed == "null" || trimmed == "[]" || trimmed == "{}" {
+			continue
+		}
 		return true
 	}
 	return false
 }
 
-// objectHasContent looks for non-empty content-bearing fields one level deep.
+// objectHasContent looks for non-empty content-bearing fields.
 func objectHasContent(object map[string]json.RawMessage) bool {
-	for _, key := range []string{"text", "arguments", "partial_json", "input_json_delta", "reasoning_content", "content"} {
+	for _, key := range []string{
+		"text", "thinking", "arguments", "partial_json", "input_json_delta",
+		"reasoning_content", "content", "input",
+	} {
 		raw, ok := object[key]
 		if !ok {
 			continue
@@ -352,6 +399,13 @@ func objectHasContent(object map[string]json.RawMessage) bool {
 		var asList []json.RawMessage
 		if errUnmarshal := json.Unmarshal(raw, &asList); errUnmarshal == nil {
 			if len(asList) > 0 {
+				return true
+			}
+			continue
+		}
+		var asObject map[string]json.RawMessage
+		if errUnmarshal := json.Unmarshal(raw, &asObject); errUnmarshal == nil {
+			if len(asObject) > 0 {
 				return true
 			}
 		}

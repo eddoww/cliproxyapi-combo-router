@@ -195,11 +195,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodPluginQuiesce:
-		waitForWorkers(5 * time.Second)
-		return okEnvelope(map[string]any{})
+		return okEnvelope(map[string]any{"drained": waitForWorkers(5 * time.Second)})
 	case pluginabi.MethodPluginShutdown:
-		waitForWorkers(2 * time.Second)
-		return okEnvelope(map[string]any{})
+		return okEnvelope(map[string]any{"drained": waitForWorkers(2 * time.Second)})
 	case pluginabi.MethodModelRoute:
 		return routeCombo(request)
 	case pluginabi.MethodExecutorIdentifier:
