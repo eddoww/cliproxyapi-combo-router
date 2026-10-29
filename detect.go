@@ -131,7 +131,20 @@ func trailingTurn(items []json.RawMessage, assistantRoles ...string) []json.RawM
 		assistant[role] = struct{}{}
 	}
 	start := 0
-	for i := len(items) - 1; i >= 0; i-- {
+	end := len(items)
+	// An assistant prefill as the final item is not a completed turn; the user
+	// turn to inspect sits before it.
+	if end > 0 {
+		var probe struct {
+			Role string `json:"role"`
+		}
+		if errUnmarshal := json.Unmarshal(items[end-1], &probe); errUnmarshal == nil {
+			if _, isAssistant := assistant[strings.ToLower(strings.TrimSpace(probe.Role))]; isAssistant {
+				end--
+			}
+		}
+	}
+	for i := end - 1; i >= 0; i-- {
 		var probe struct {
 			Role string `json:"role"`
 		}
@@ -143,7 +156,10 @@ func trailingTurn(items []json.RawMessage, assistantRoles ...string) []json.RawM
 			break
 		}
 	}
-	return items[start:]
+	if start > end {
+		return nil
+	}
+	return items[start:end]
 }
 
 func scanMessage(raw json.RawMessage, required map[string]struct{}) {
@@ -222,6 +238,14 @@ func addBlockCapability(block map[string]json.RawMessage, required map[string]st
 			addByMime(mime, required)
 		} else {
 			required[capPDF] = struct{}{}
+		}
+	case "tool_result", "function_call_output", "tool":
+		// Tool output can embed images/documents; inspect it like user content.
+		if rawContent, ok := block["content"]; ok {
+			scanContent(rawContent, required)
+		}
+		if rawOutput, ok := block["output"]; ok {
+			scanContent(rawOutput, required)
 		}
 	}
 

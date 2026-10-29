@@ -78,6 +78,9 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 		return pluginConfig{}, errUnmarshal
 	}
 	cfg.DefaultStrategy = normalizeStrategy(cfg.DefaultStrategy)
+	if cfg.DefaultStrategy == "" {
+		cfg.DefaultStrategy = strategyFallback
+	}
 	for i := range cfg.Combos {
 		combo := &cfg.Combos[i]
 		combo.Name = strings.TrimSpace(combo.Name)
@@ -120,9 +123,13 @@ func loadedConfig() pluginConfig {
 	return defaultPluginConfig()
 }
 
+// normalizeStrategy returns "" for an unset strategy so callers can distinguish
+// "inherit the default" from an explicit choice.
 func normalizeStrategy(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", strategyFallback:
+	case "":
+		return ""
+	case strategyFallback:
 		return strategyFallback
 	case strategyRoundRobin, "round_robin", "roundrobin":
 		return strategyRoundRobin

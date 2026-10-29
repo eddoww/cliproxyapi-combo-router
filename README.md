@@ -20,7 +20,8 @@ Requests to a combo are tried member by member until one succeeds.
 
 **Capability-aware ordering.** On every request the plugin inspects the *current user turn* for
 images, audio, video, PDFs and tools. Members that advertise the needed capabilities are floated to
-the front. Members are **never dropped**, so fallback stays intact.
+the front. Members are **never dropped** by capability ordering, so fallback stays intact. Empty entries,
+duplicates and a combo naming itself are removed at load time.
 
 ```
 combo "smart": [deepseek-v4-pro (no vision), grok-4.7 (vision)]
@@ -31,12 +32,17 @@ combo "smart": [deepseek-v4-pro (no vision), grok-4.7 (vision)]
 Only the trailing user turn is inspected, so an image earlier in a conversation does not pin the
 whole session to a vision model.
 
-**Cross-model fallback.** A member hands over to the next one on `401, 403, 404, 408, 409, 425,
-429, 5xx` and on transport errors. Genuine request errors (`400, 413, 422`) are returned unchanged.
-Streaming falls back the same way as long as no chunk has been sent to the client yet.
+**Cross-model fallback.** A member hands over to the next one on `401, 403, 404, 408, 429`, any
+`5xx`, and transport errors. Genuine request errors (`400, 413, 422`) are terminal and are returned
+with their upstream HTTP status. A member that returns `2xx` with an empty body is treated as a
+failed attempt so the next member can answer. Streaming falls back the same way, but only while
+**no meaningful payload has reached the client**: once output is emitted the stream is committed to
+that member, because switching would splice two answers together.
 
 **Round-robin.** Optional `strategy: round-robin` per combo spreads requests across members instead
-of always preferring the first one. Capability ordering still applies within the rotation.
+of always preferring the first one. Rotation advances exactly once per execution. Capability
+ordering still applies within the rotation. `default_strategy` applies to combos that omit their own
+`strategy`.
 
 ## Install
 
@@ -85,9 +91,11 @@ Restart the proxy after adding or replacing the shared library.
 | `combos[].strategy` | inherits | Overrides `default_strategy`. |
 | `capabilities` | — | Per-model capability override: `vision`, `audio`, `video`, `pdf`, `tools`. Replaces built-ins. |
 
-Built-in capability prefixes live in `catalog.go` (Claude/GPT/Gemini/Grok families get vision and
-PDF, Gemini also audio/video, DeepSeek/Mistral/Llama/Qwen get tools only). Unknown models advertise
-nothing, which sorts them behind known-capable members but keeps them in the chain.
+Built-in capability prefixes live in `catalog.go`: Claude, GPT-4/5, o-series and Gemini get vision
+and PDF (Gemini also audio/video); Grok 3/4 get vision; `gpt-oss`, `gpt-3`, GPT-2-era and
+DeepSeek/Mistral/Llama/Qwen advertise tools only. Unknown models advertise nothing, which sorts them
+behind known-capable members but keeps them in the chain. Override keys may be qualified
+(`openrouter/gpt-5`) or bare (`gpt-5`); both are honoured.
 
 ## Build
 
@@ -126,4 +134,7 @@ initContainers:
   small fork.
 - Combos are resolved by model name only; they are not listed in `/v1/models` unless a provider
   credential advertises them (clients can still request them by name).
+- Media in *earlier* conversation turns is ignored when choosing a member, even though the request
+  still carries it. A text follow-up can therefore select a member that would reject the historical
+  image; configure the combo so the first member can handle your history, or strip history upstream.
 - Token counting returns a zero estimate; the combo executor does not own a tokenizer.

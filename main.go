@@ -70,7 +70,10 @@ import "C"
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -89,8 +92,10 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code              string `json:"code"`
+	Message           string `json:"message"`
+	HTTPStatus        int    `json:"http_status,omitempty"`
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
 }
 
 type lifecycleRequest struct {
@@ -151,7 +156,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	if request != nil && requestLen > 0 {
 		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
+	raw, errHandle := safeHandleMethod(C.GoString(method), requestBytes)
 	if errHandle != nil {
 		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
 		return 1
@@ -170,6 +175,18 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {}
 
+// safeHandleMethod keeps a panic inside one plugin call from unwinding into the
+// host process that loaded this shared library.
+func safeHandleMethod(method string, request []byte) (out []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			out = errorEnvelope("plugin_panic", fmt.Sprintf("combo-router panic in %s: %v", method, recovered))
+			err = nil
+		}
+	}()
+	return handleMethod(method, request)
+}
+
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
@@ -177,7 +194,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, errConfigure
 		}
 		return okEnvelope(pluginRegistration())
-	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
+	case pluginabi.MethodPluginQuiesce:
+		waitForWorkers(5 * time.Second)
+		return okEnvelope(map[string]any{})
+	case pluginabi.MethodPluginShutdown:
+		waitForWorkers(2 * time.Second)
 		return okEnvelope(map[string]any{})
 	case pluginabi.MethodModelRoute:
 		return routeCombo(request)
@@ -250,6 +271,61 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	response.len = C.size_t(len(raw))
 }
 
+// hostError carries the upstream HTTP status the host attached to a failed
+// callback, so routing policy can distinguish a 400 from a 503.
+type hostError struct {
+	code       string
+	message    string
+	status     int
+	retryAfter int
+}
+
+func (e *hostError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.code != "" {
+		return e.code + ": " + e.message
+	}
+	return e.message
+}
+
+// statusOf extracts an upstream status from an error chain, or 0 when unknown.
+func statusOf(err error) int {
+	var typed *hostError
+	if errors.As(err, &typed) && typed != nil {
+		return typed.status
+	}
+	return 0
+}
+
+var (
+	workersMu sync.Mutex
+	workers   sync.WaitGroup
+)
+
+func trackWorker(delta int) {
+	workersMu.Lock()
+	defer workersMu.Unlock()
+	if delta > 0 {
+		workers.Add(delta)
+	} else {
+		workers.Done()
+	}
+}
+
+func waitForWorkers(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+}
+
 func callHost(method string, payload any) (json.RawMessage, error) {
 	var request []byte
 	if payload != nil {
@@ -282,7 +358,12 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 	}
 	if !env.OK {
 		if env.Error != nil {
-			return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+			return nil, &hostError{
+				code:       env.Error.Code,
+				message:    env.Error.Message,
+				status:     env.Error.HTTPStatus,
+				retryAfter: env.Error.RetryAfterSeconds,
+			}
 		}
 		return nil, fmt.Errorf("host callback %s failed", method)
 	}

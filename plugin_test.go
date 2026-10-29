@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestDetectOpenAIChatVision(t *testing.T) {
 	body := []byte(`{
@@ -123,5 +126,99 @@ func TestRetryableStatus(t *testing.T) {
 		if retryableStatus(status) {
 			t.Fatalf("status %d should not be retryable", status)
 		}
+	}
+}
+
+func TestDetectAssistantPrefillInspectsUserTurn(t *testing.T) {
+	body := []byte(`{
+		"model": "smart",
+		"messages": [
+			{"role": "user", "content": [
+				{"type": "text", "text": "what is this?"},
+				{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+			]},
+			{"role": "assistant", "content": "It is"}
+		]
+	}`)
+	required := detectRequiredCapabilities("openai", body)
+	if _, ok := required[capVision]; !ok {
+		t.Fatalf("assistant prefill must not hide the user image: %v", required)
+	}
+}
+
+func TestDetectNestedToolResultFile(t *testing.T) {
+	body := []byte(`{
+		"model": "smart",
+		"messages": [{"role": "user", "content": [
+			{"type": "tool_result", "tool_use_id": "t1", "content": [
+				{"type": "text", "text": "read it"},
+				{"type": "image", "source": {"media_type": "image/png", "data": "AAA"}}
+			]}
+		]}]
+	}`)
+	required := detectRequiredCapabilities("claude", body)
+	if _, ok := required[capVision]; !ok {
+		t.Fatalf("tool result images must be detected: %v", required)
+	}
+}
+
+func TestQualifiedCapabilityOverride(t *testing.T) {
+	overrides := map[string][]string{"openrouter/gpt-5": {capTools}}
+	have := capabilitiesFor("openrouter/gpt-5", overrides)
+	if _, ok := have[capVision]; ok {
+		t.Fatalf("qualified override must replace built-ins: %v", have)
+	}
+	if _, ok := have[capTools]; !ok {
+		t.Fatalf("qualified override must be applied: %v", have)
+	}
+}
+
+func TestGPTOSSIsNotVisionCapable(t *testing.T) {
+	have := capabilitiesFor("gpt-oss-120b", nil)
+	if _, ok := have[capVision]; ok {
+		t.Fatalf("gpt-oss must not claim vision: %v", have)
+	}
+}
+
+func TestDefaultStrategyInherited(t *testing.T) {
+	cfg, errDecode := decodeConfig([]byte("default_strategy: round-robin\ncombos:\n  - name: c\n    models: [a, b]\n"))
+	if errDecode != nil {
+		t.Fatalf("decode: %v", errDecode)
+	}
+	if cfg.Combos[0].Strategy != strategyRoundRobin {
+		t.Fatalf("combo must inherit default_strategy, got %q", cfg.Combos[0].Strategy)
+	}
+}
+
+func TestRoundRobinAdvancesOncePerExecution(t *testing.T) {
+	cfg := pluginConfig{DefaultStrategy: strategyRoundRobin}
+	combo := comboConfig{Name: "once", Models: []string{"a", "b", "c"}}
+	first := orderMembers(combo, cfg, nil, true)
+	second := orderMembers(combo, cfg, nil, true)
+	if first[0] != "a" || second[0] != "b" {
+		t.Fatalf("expected a then b, got %v then %v", first, second)
+	}
+}
+
+func TestMeaningfulPayloadFiltersTerminalMarkers(t *testing.T) {
+	if isMeaningfulPayload([]byte("data: [DONE]\n")) {
+		t.Fatal("[DONE] alone is not content")
+	}
+	if isMeaningfulPayload([]byte("event: response.created\ndata: {\"type\":\"response.created\"}\n")) {
+		t.Fatal("control events alone are not content")
+	}
+	if !isMeaningfulPayload([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n")) {
+		t.Fatal("content delta must count as output")
+	}
+}
+
+func TestErrorEnvelopeCarriesStatus(t *testing.T) {
+	raw := errorEnvelopeStatus("executor_error", "bad request", 400)
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatalf("decode: %v", errUnmarshal)
+	}
+	if env.OK || env.Error == nil || env.Error.HTTPStatus != 400 {
+		t.Fatalf("expected http_status 400, got %s", raw)
 	}
 }

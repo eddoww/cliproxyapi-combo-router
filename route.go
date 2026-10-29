@@ -25,15 +25,6 @@ func nextRotation(name string, size int) int {
 	return pos
 }
 
-func peekRotation(name string, size int) int {
-	if size <= 0 {
-		return 0
-	}
-	rotationMu.Lock()
-	defer rotationMu.Unlock()
-	return rotationIndex[name] % size
-}
-
 // orderMembers returns the combo members in the order they should be tried.
 // Members are never dropped: capability tiers only reorder them, keeping the
 // fallback chain intact.
@@ -57,11 +48,9 @@ func orderMembers(combo comboConfig, cfg pluginConfig, required map[string]struc
 		strategy = cfg.DefaultStrategy
 	}
 	if strategy == strategyRoundRobin {
-		var pos int
+		pos := 0
 		if advanceRotation {
 			pos = nextRotation(combo.Name, len(base))
-		} else {
-			pos = peekRotation(combo.Name, len(base))
 		}
 		if pos != 0 {
 			rotated := make([]string, 0, len(base))
@@ -141,13 +130,13 @@ func routeCombo(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 	}
 	required := detectRequiredCapabilities(req.SourceFormat, req.Body)
-	ordered := orderMembers(combo, cfg, required, true)
+	ordered := orderMembers(combo, cfg, required, false)
 	if len(ordered) == 0 {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "combo_has_no_members"})
 	}
 	return okEnvelope(pluginapi.ModelRouteResponse{
 		Handled:    true,
 		TargetKind: pluginapi.ModelRouteTargetSelf,
-		Reason:     "combo:" + combo.Name + ":first=" + ordered[0],
+		Reason:     "combo:" + combo.Name,
 	})
 }

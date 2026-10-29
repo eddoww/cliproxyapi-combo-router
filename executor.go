@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -34,25 +35,30 @@ func hostLog(hostCallbackID, level, message string, fields map[string]any) {
 }
 
 // retryableStatus reports whether a failed member should hand over to the next
-// combo member. Client errors that describe the request itself (400, 413, 422)
-// are returned to the caller unchanged.
+// combo member. Request errors that describe the request itself (400, 413, 422)
+// are terminal and are returned to the caller with their upstream status.
 func retryableStatus(status int) bool {
 	switch status {
-	case http.StatusUnauthorized,
+	case http.StatusRequestTimeout,
+		http.StatusUnauthorized,
 		http.StatusForbidden,
 		http.StatusNotFound,
-		http.StatusRequestTimeout,
-		http.StatusConflict,
-		http.StatusTooEarly,
-		http.StatusTooManyRequests,
-		http.StatusInternalServerError,
-		http.StatusBadGateway,
-		http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout:
+		http.StatusTooManyRequests:
 		return true
 	default:
 		return status >= 500
 	}
+}
+
+// errorEnvelopeStatus preserves the upstream HTTP status for the host so the
+// client sees the real status instead of a blanket 500.
+func errorEnvelopeStatus(code, message string, status int) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
+		Code:       code,
+		Message:    message,
+		HTTPStatus: status,
+	}})
+	return raw
 }
 
 func requestBody(exec pluginapi.ExecutorRequest) []byte {
@@ -104,7 +110,7 @@ func planFor(exec pluginapi.ExecutorRequest) ([]string, error) {
 	}
 	format := protocolFormat(exec)
 	required := detectRequiredCapabilities(format, requestBody(exec))
-	ordered := orderMembers(combo, cfg, required, false)
+	ordered := orderMembers(combo, cfg, required, true)
 	if len(ordered) == 0 {
 		return nil, fmt.Errorf("combo %q has no usable members", exec.Model)
 	}
@@ -124,27 +130,45 @@ func executeCombo(raw []byte) ([]byte, error) {
 	body := requestBody(req.ExecutorRequest)
 
 	var lastErr error
+	lastStatus := 0
 	for _, member := range ordered {
 		resp, errExecute := hostModelExecute(req.HostCallbackID, format, member, body, false)
 		hostLog(req.HostCallbackID, "debug", fmt.Sprintf("combo-router: combo=%s member=%s status=%d body_len=%d err=%s", req.Model, member, resp.StatusCode, len(resp.Body), errorString(errExecute)), nil)
 		if errExecute != nil {
 			lastErr = fmt.Errorf("%s: %w", member, errExecute)
+			lastStatus = statusOf(errExecute)
+			if lastStatus != 0 && !retryableStatus(lastStatus) {
+				return errorEnvelopeStatus("executor_error", lastErr.Error(), lastStatus), nil
+			}
 			continue
 		}
 		if resp.StatusCode >= 400 {
+			lastStatus = resp.StatusCode
 			lastErr = fmt.Errorf("%s: upstream status %d", member, resp.StatusCode)
 			if retryableStatus(resp.StatusCode) {
 				continue
 			}
-			// The request itself is bad; surface the upstream answer as-is.
-			return okEnvelope(pluginapi.ExecutorResponse{Payload: resp.Body, Headers: resp.Headers})
+			message := strings.TrimSpace(string(resp.Body))
+			if message == "" {
+				message = lastErr.Error()
+			}
+			return errorEnvelopeStatus("executor_error", message, resp.StatusCode), nil
+		}
+		if len(bytes.TrimSpace(resp.Body)) == 0 {
+			// A 2xx with no payload is not a usable answer; try the next member.
+			lastStatus = http.StatusBadGateway
+			lastErr = fmt.Errorf("%s: empty response body", member)
+			continue
 		}
 		return okEnvelope(pluginapi.ExecutorResponse{Payload: resp.Body, Headers: resp.Headers})
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("combo %q: no member produced a response", req.Model)
 	}
-	return errorEnvelope("executor_error", lastErr.Error()), nil
+	if lastStatus == 0 {
+		lastStatus = http.StatusBadGateway
+	}
+	return errorEnvelopeStatus("executor_error", lastErr.Error(), lastStatus), nil
 }
 
 func errorString(err error) string {

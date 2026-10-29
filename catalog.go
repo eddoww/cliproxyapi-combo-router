@@ -2,23 +2,26 @@ package main
 
 import "strings"
 
-// builtinCapabilityPrefixes maps a model id prefix to the capabilities the
-// upstream model family accepts. Unknown models deliberately advertise nothing,
-// so they sort behind known-capable members while still staying in the fallback
-// chain.
+// builtinCapabilityPrefixes maps a model-family prefix to the capabilities the
+// upstream accepts. Entries are deliberately conservative: a false positive puts
+// an incapable member ahead of a capable one, which is worse than the reverse.
+// Unknown models advertise nothing and stay in the chain behind capable members.
 var builtinCapabilityPrefixes = []struct {
 	prefix string
 	caps   []string
 }{
 	{"claude", []string{capVision, capPDF, capTools}},
-	{"gpt-", []string{capVision, capPDF, capTools}},
+	{"gpt-5", []string{capVision, capPDF, capTools}},
+	{"gpt-4", []string{capVision, capPDF, capTools}},
+	{"gpt-oss", []string{capTools}},
+	{"gpt-3", []string{capTools}},
 	{"o1", []string{capVision, capPDF, capTools}},
 	{"o3", []string{capVision, capPDF, capTools}},
 	{"o4", []string{capVision, capPDF, capTools}},
 	{"gemini", []string{capVision, capPDF, capAudio, capVideo, capTools}},
-	{"grok-4", []string{capVision, capPDF, capTools}},
+	{"grok-4", []string{capVision, capTools}},
 	{"grok-3", []string{capVision, capTools}},
-	{"grok-2", []string{capVision, capTools}},
+	{"grok-2", []string{capTools}},
 	{"kimi", []string{capVision, capTools}},
 	{"qwen-vl", []string{capVision, capPDF, capTools}},
 	{"glm-4v", []string{capVision, capTools}},
@@ -29,21 +32,25 @@ var builtinCapabilityPrefixes = []struct {
 	{"qwen", []string{capTools}},
 }
 
-// capabilitiesFor returns the capability set for a model id. The model may be
-// prefixed ("openai/gpt-5", "deepseek/deepseek-v4-pro"); the prefix is ignored
-// for lookup. Config overrides replace the built-in answer entirely.
+// capabilitiesFor returns the capability set for a model id. Overrides are
+// matched against the full qualified id first ("openrouter/gpt-5"), then against
+// the unqualified model name ("gpt-5"), so both spellings work.
 func capabilitiesFor(model string, overrides map[string][]string) map[string]struct{} {
-	lookup := strings.ToLower(strings.TrimSpace(model))
-	if idx := strings.LastIndex(lookup, "/"); idx >= 0 {
-		lookup = lookup[idx+1:]
+	full := strings.ToLower(strings.TrimSpace(model))
+	unqualified := full
+	if idx := strings.LastIndex(full, "/"); idx >= 0 {
+		unqualified = full[idx+1:]
 	}
 	if overrides != nil {
-		if caps, ok := overrides[lookup]; ok {
+		if caps, ok := overrides[full]; ok {
+			return toCapSet(caps)
+		}
+		if caps, ok := overrides[unqualified]; ok {
 			return toCapSet(caps)
 		}
 	}
 	for _, entry := range builtinCapabilityPrefixes {
-		if strings.HasPrefix(lookup, entry.prefix) {
+		if strings.HasPrefix(unqualified, entry.prefix) {
 			return toCapSet(entry.caps)
 		}
 	}
