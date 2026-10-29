@@ -78,6 +78,10 @@ plugins:
 The plugin id (`combo-router`) is derived from the file name, so the config key and the file name
 must match.
 
+When writing this block through the management API (`PUT /v8/management/config/plugins/configs/combo-router`),
+include `enabled` explicitly: a missing or null value is treated as *disabled*, and the plugin
+silently stops loading. The dashboard always sends it.
+
 Restart the proxy after adding or replacing the shared library.
 
 ## Configuration reference
