@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    container: golang:1.26.10-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: go test ./...
+        env:
+          GOFLAGS: -p=4
+          CGO_ENABLED: "1"
+      - name: Build shared library
+        run: |
+          mkdir -p dist
+          go build -buildvcs=false -ldflags="-s -w" -buildmode=c-shared -o dist/combo-router.so .
+          rm -f dist/combo-router.h
+        env:
+          GOFLAGS: -p=4
+          CGO_ENABLED: "1"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: combo-router-so
+          path: dist/combo-router.so
+      - name: Attach binary to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/combo-router.so
