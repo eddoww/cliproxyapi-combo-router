@@ -163,7 +163,7 @@ func streamMember(hostCallbackID, pluginStreamID, format, member string, body []
 	if errCall != nil {
 		status := statusOf(errCall)
 		return streamOutcome{
-			terminal: status != 0 && !retryableStatus(status),
+			terminal: !retryableError(errCall, status),
 			status:   status,
 			err:      fmt.Errorf("%s: %w", member, errCall),
 		}
@@ -174,10 +174,11 @@ func streamMember(hostCallbackID, pluginStreamID, format, member string, body []
 	}
 	if resp.StatusCode >= 400 {
 		_ = closeHostModelStream(resp.StreamID)
+		errStatus := fmt.Errorf("%s: upstream status %d", member, resp.StatusCode)
 		return streamOutcome{
-			terminal: !retryableStatus(resp.StatusCode),
+			terminal: !retryableError(errStatus, resp.StatusCode),
 			status:   resp.StatusCode,
-			err:      fmt.Errorf("%s: upstream status %d", member, resp.StatusCode),
+			err:      errStatus,
 		}
 	}
 	if strings.TrimSpace(resp.StreamID) == "" {

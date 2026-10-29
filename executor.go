@@ -50,6 +50,31 @@ func retryableStatus(status int) bool {
 	}
 }
 
+// retryableError decides whether a failed member should hand over. A missing or
+// unsupported member model is a configuration problem in the combo, not a bad
+// client request, so it falls through even though the host reports it as 400.
+func retryableError(err error, status int) bool {
+	if status != 0 && retryableStatus(status) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"model_not_found",
+		"unknown provider for model",
+		"model not found",
+		"unsupported model",
+		"no available auth",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // errorEnvelopeStatus preserves the upstream HTTP status for the host so the
 // client sees the real status instead of a blanket 500.
 func errorEnvelopeStatus(code, message string, status int) []byte {
@@ -137,7 +162,7 @@ func executeCombo(raw []byte) ([]byte, error) {
 		if errExecute != nil {
 			lastErr = fmt.Errorf("%s: %w", member, errExecute)
 			lastStatus = statusOf(errExecute)
-			if lastStatus != 0 && !retryableStatus(lastStatus) {
+			if !retryableError(errExecute, lastStatus) {
 				return errorEnvelopeStatus("executor_error", lastErr.Error(), lastStatus), nil
 			}
 			continue
