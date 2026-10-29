@@ -92,7 +92,7 @@ Restart the proxy after adding or replacing the shared library.
 | `capabilities` | — | Per-model capability override: `vision`, `audio`, `video`, `pdf`, `tools`. Replaces built-ins. |
 
 Built-in capability prefixes live in `catalog.go`: Claude, GPT-4/5, o-series and Gemini get vision
-and PDF (Gemini also audio/video); Grok 3/4 get vision; `gpt-oss`, `gpt-3`, GPT-2-era and
+and PDF (Gemini also audio/video); Grok 3/4 get vision; `gpt-oss`, `gpt-3`, `grok-2` and
 DeepSeek/Mistral/Llama/Qwen advertise tools only. Unknown models advertise nothing, which sorts them
 behind known-capable members but keeps them in the chain. Override keys may be qualified
 (`openrouter/gpt-5`) or bare (`gpt-5`); both are honoured.

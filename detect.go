@@ -200,6 +200,9 @@ func scanMessage(raw json.RawMessage, required map[string]struct{}) {
 	if rawParts, ok := message["parts"]; ok { // Gemini content
 		scanContent(rawParts, required)
 	}
+	// Responses tool outputs carry their payload at item level (output), and
+	// Claude tool_result blocks can sit directly on the item.
+	addBlockCapability(message, required)
 }
 
 func scanContent(raw json.RawMessage, required map[string]struct{}) {

@@ -200,15 +200,27 @@ func TestRoundRobinAdvancesOncePerExecution(t *testing.T) {
 	}
 }
 
-func TestMeaningfulPayloadFiltersTerminalMarkers(t *testing.T) {
-	if isMeaningfulPayload([]byte("data: [DONE]\n")) {
-		t.Fatal("[DONE] alone is not content")
+func TestHasRealContent(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{"done marker", "data: [DONE]\n", false},
+		{"claude message_stop", "event: message_stop\ndata: {\"type\":\"message_stop\"}\n", false},
+		{"claude message_start", "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n", false},
+		{"responses created", "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"output\":[]}}\n", false},
+		{"chat role only", "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n", false},
+		{"chat content", "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n", true},
+		{"chat tool call", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[]}}]}\n", true},
+		{"claude text delta", "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n", true},
+		{"claude empty delta", "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}\n", false},
+		{"non-sse payload", "raw-bytes", true},
 	}
-	if isMeaningfulPayload([]byte("event: response.created\ndata: {\"type\":\"response.created\"}\n")) {
-		t.Fatal("control events alone are not content")
-	}
-	if !isMeaningfulPayload([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n")) {
-		t.Fatal("content delta must count as output")
+	for _, testCase := range cases {
+		if got := hasRealContent([]byte(testCase.payload)); got != testCase.want {
+			t.Fatalf("%s: hasRealContent=%v want %v", testCase.name, got, testCase.want)
+		}
 	}
 }
 

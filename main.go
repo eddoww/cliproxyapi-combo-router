@@ -300,29 +300,46 @@ func statusOf(err error) int {
 }
 
 var (
-	workersMu sync.Mutex
-	workers   sync.WaitGroup
+	// workersMu guards admission against the WaitGroup so a worker can never be
+	// added while quiesce is waiting.
+	workersMu       sync.Mutex
+	workers         sync.WaitGroup
+	admissionClosed bool
 )
 
-func trackWorker(delta int) {
+// startWorker admits a stream worker, or reports false once quiesce has begun.
+func startWorker() bool {
 	workersMu.Lock()
 	defer workersMu.Unlock()
-	if delta > 0 {
-		workers.Add(delta)
-	} else {
-		workers.Done()
+	if admissionClosed {
+		return false
 	}
+	workers.Add(1)
+	return true
 }
 
-func waitForWorkers(timeout time.Duration) {
+func finishWorker() {
+	workers.Done()
+}
+
+// waitForWorkers closes admission and waits for running streams, bounded by
+// timeout. It reports whether all workers drained.
+func waitForWorkers(timeout time.Duration) bool {
+	workersMu.Lock()
+	admissionClosed = true
+	workersMu.Unlock()
+
 	done := make(chan struct{})
 	go func() {
+		defer close(done)
+		defer func() { _ = recover() }()
 		workers.Wait()
-		close(done)
 	}()
 	select {
 	case <-done:
+		return true
 	case <-time.After(timeout):
+		return false
 	}
 }
 

@@ -100,8 +100,8 @@ func hostModelExecute(hostCallbackID, format, model string, body []byte, stream 
 }
 
 // planFor returns the ordered member list for the combo carried by an execution
-// request. Rotation position is only advanced by the router, so the executor
-// uses the same position the route decision used.
+// request. Round-robin advances exactly once here, so the plan for this
+// execution is fixed before any member is tried.
 func planFor(exec pluginapi.ExecutorRequest) ([]string, error) {
 	cfg := loadedConfig()
 	combo, ok := cfg.comboByName(exec.Model)

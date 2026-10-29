@@ -11,6 +11,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
+// preCommitBufferLimit bounds how long a member may emit framing-only events
+// before the stream is committed to it anyway.
+const preCommitBufferLimit = 256 << 10
+
 type rpcStreamEmitRequest struct {
 	StreamID    string           `json:"stream_id"`
 	Payload     []byte           `json:"payload,omitempty"`
@@ -73,9 +77,11 @@ func executeComboStream(raw []byte) ([]byte, error) {
 	if streamID == "" {
 		return errorEnvelope("executor_error", "stream_id is required for executor.execute_stream"), nil
 	}
-	trackWorker(1)
+	if !startWorker() {
+		return errorEnvelopeStatus("executor_error", "combo-router is shutting down", http.StatusServiceUnavailable), nil
+	}
 	go func() {
-		defer trackWorker(-1)
+		defer finishWorker()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				closePluginStream(streamID, fmt.Sprintf("combo stream orchestration panic: %v", recovered))
@@ -93,9 +99,20 @@ func executeComboStream(raw []byte) ([]byte, error) {
 	})
 }
 
-// runComboStream tries members in order. Once any payload reaches the client the
-// stream is committed to that member: a later failure is terminal, because
-// appending another model's output would splice two answers together.
+// streamOutcome describes what happened to one member's stream.
+type streamOutcome struct {
+	// committed means payload has reached the client; no fallback is allowed.
+	committed bool
+	// terminal means the failure must not be retried (client gone, bad request).
+	terminal bool
+	status   int
+	err      error
+}
+
+// runComboStream tries members in order. Each member's framing is buffered until
+// it produces real content, so a member that fails before output leaves no trace
+// for the client. After output, the stream is committed and protocol events are
+// forwarded verbatim.
 func runComboStream(req rpcExecutorRequest, pluginStreamID string) (int, error) {
 	ordered, errPlan := planFor(req.ExecutorRequest)
 	if errPlan != nil {
@@ -107,19 +124,18 @@ func runComboStream(req rpcExecutorRequest, pluginStreamID string) (int, error) 
 	var lastErr error
 	lastStatus := 0
 	for _, member := range ordered {
-		emitted, status, errMember := streamMember(req.HostCallbackID, pluginStreamID, format, member, body)
-		if emitted {
-			// Committed: never fall back after partial output.
-			return status, errMember
+		outcome := streamMember(req.HostCallbackID, pluginStreamID, format, member, body)
+		if outcome.committed || outcome.terminal {
+			return outcome.status, outcome.err
 		}
-		if errMember == nil {
-			errMember = fmt.Errorf("%s: upstream stream produced no output", member)
-			status = http.StatusBadGateway
+		if outcome.err == nil {
+			outcome.err = fmt.Errorf("%s: upstream stream produced no content", member)
+			outcome.status = http.StatusBadGateway
 		}
-		lastErr = errMember
-		lastStatus = status
-		if status != 0 && !retryableStatus(status) {
-			return status, errMember
+		lastErr = outcome.err
+		lastStatus = outcome.status
+		if outcome.status != 0 && !retryableStatus(outcome.status) {
+			return outcome.status, outcome.err
 		}
 	}
 	if lastErr == nil {
@@ -131,9 +147,9 @@ func runComboStream(req rpcExecutorRequest, pluginStreamID string) (int, error) 
 	return lastStatus, lastErr
 }
 
-// streamMember forwards one combo member's stream to the client. It reports
-// whether any meaningful payload reached the client and the upstream status.
-func streamMember(hostCallbackID, pluginStreamID, format, member string, body []byte) (bool, int, error) {
+// streamMember forwards one combo member's stream. Framing-only chunks are held
+// back until the first real content arrives or the buffer limit is reached.
+func streamMember(hostCallbackID, pluginStreamID, format, member string, body []byte) streamOutcome {
 	raw, errCall := callHost(pluginabi.MethodHostModelExecuteStream, hostModelExecuteRequest{
 		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
 			EntryProtocol: format,
@@ -145,81 +161,198 @@ func streamMember(hostCallbackID, pluginStreamID, format, member string, body []
 		HostCallbackID: hostCallbackID,
 	})
 	if errCall != nil {
-		return false, statusOf(errCall), fmt.Errorf("%s: %w", member, errCall)
+		status := statusOf(errCall)
+		return streamOutcome{
+			terminal: status != 0 && !retryableStatus(status),
+			status:   status,
+			err:      fmt.Errorf("%s: %w", member, errCall),
+		}
 	}
 	var resp pluginapi.HostModelStreamResponse
 	if errDecode := json.Unmarshal(raw, &resp); errDecode != nil {
-		return false, 0, errDecode
+		return streamOutcome{terminal: true, status: http.StatusInternalServerError, err: errDecode}
 	}
 	if resp.StatusCode >= 400 {
 		_ = closeHostModelStream(resp.StreamID)
-		return false, resp.StatusCode, fmt.Errorf("%s: upstream status %d", member, resp.StatusCode)
+		return streamOutcome{
+			terminal: !retryableStatus(resp.StatusCode),
+			status:   resp.StatusCode,
+			err:      fmt.Errorf("%s: upstream status %d", member, resp.StatusCode),
+		}
 	}
 	if strings.TrimSpace(resp.StreamID) == "" {
-		return false, http.StatusBadGateway, fmt.Errorf("%s: host returned an empty stream id", member)
+		return streamOutcome{status: http.StatusBadGateway, err: fmt.Errorf("%s: host returned an empty stream id", member)}
 	}
 	defer func() { _ = closeHostModelStream(resp.StreamID) }()
 
-	emitted := false
+	var pending [][]byte
+	pendingBytes := 0
+	committed := false
+
+	commit := func() error {
+		for _, chunk := range pending {
+			if errEmit := emitStreamChunk(pluginStreamID, chunk); errEmit != nil {
+				return errEmit
+			}
+		}
+		pending = nil
+		committed = true
+		return nil
+	}
+
 	for {
 		chunkRaw, errRead := callHost(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: resp.StreamID})
 		if errRead != nil {
-			return emitted, statusOf(errRead), fmt.Errorf("%s: %w", member, errRead)
+			status := statusOf(errRead)
+			if !committed {
+				return streamOutcome{terminal: status != 0 && !retryableStatus(status), status: status, err: fmt.Errorf("%s: %w", member, errRead)}
+			}
+			return streamOutcome{committed: true, terminal: true, status: status, err: fmt.Errorf("%s: %w", member, errRead)}
 		}
 		var chunk pluginapi.HostModelStreamReadResponse
 		if errDecode := json.Unmarshal(chunkRaw, &chunk); errDecode != nil {
-			return emitted, 0, errDecode
+			return streamOutcome{committed: committed, terminal: true, status: http.StatusInternalServerError, err: errDecode}
 		}
 		if chunk.Error != "" {
-			return emitted, http.StatusBadGateway, fmt.Errorf("%s: %s", member, chunk.Error)
-		}
-		if len(chunk.Payload) > 0 && isMeaningfulPayload(chunk.Payload) {
-			if errEmit := emitStreamChunk(pluginStreamID, bytes.Clone(chunk.Payload)); errEmit != nil {
-				// The client is gone or the host stream is closed; stop here
-				// rather than starting another upstream member.
-				return emitted, http.StatusBadGateway, fmt.Errorf("%s: client stream closed: %w", member, errEmit)
+			if !committed {
+				return streamOutcome{status: http.StatusBadGateway, err: fmt.Errorf("%s: %s", member, chunk.Error)}
 			}
-			emitted = true
+			return streamOutcome{committed: true, terminal: true, status: http.StatusBadGateway, err: fmt.Errorf("%s: %s", member, chunk.Error)}
+		}
+		if len(chunk.Payload) > 0 {
+			if committed {
+				if errEmit := emitStreamChunk(pluginStreamID, bytes.Clone(chunk.Payload)); errEmit != nil {
+					return streamOutcome{committed: true, terminal: true, status: http.StatusBadGateway, err: fmt.Errorf("%s: client stream closed: %w", member, errEmit)}
+				}
+			} else {
+				pending = append(pending, bytes.Clone(chunk.Payload))
+				pendingBytes += len(chunk.Payload)
+				if hasRealContent(chunk.Payload) || pendingBytes >= preCommitBufferLimit {
+					if errCommit := commit(); errCommit != nil {
+						// The client is gone; never start another member.
+						return streamOutcome{committed: true, terminal: true, status: http.StatusBadGateway, err: fmt.Errorf("%s: client stream closed: %w", member, errCommit)}
+					}
+				}
+			}
 		}
 		if chunk.Done {
 			break
 		}
 	}
-	return emitted, http.StatusOK, nil
+	if !committed {
+		// Only framing arrived: fall back without exposing it to the client.
+		return streamOutcome{status: http.StatusBadGateway, err: fmt.Errorf("%s: stream ended without content", member)}
+	}
+	return streamOutcome{committed: true, status: http.StatusOK}
 }
 
-// isMeaningfulPayload filters protocol framing that carries no content, such as
-// an SSE terminal marker on its own, so a "successful" empty stream still falls
-// back to the next member.
-func isMeaningfulPayload(payload []byte) bool {
+// hasRealContent reports whether an SSE chunk carries actual model output rather
+// than protocol framing. Unknown shapes count as content so nothing is dropped
+// by accident.
+func hasRealContent(payload []byte) bool {
 	text := strings.TrimSpace(string(payload))
 	if text == "" {
 		return false
 	}
-	meaningful := false
+	sawData := false
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		if line == "data: [DONE]" || line == "[DONE]" {
+		sawData = true
+		dataText := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if dataText == "" || dataText == "[DONE]" {
 			continue
 		}
-		if strings.HasPrefix(line, "event:") || strings.HasPrefix(line, "id:") || strings.HasPrefix(line, ":") {
-			continue
+		var event map[string]json.RawMessage
+		if errUnmarshal := json.Unmarshal([]byte(dataText), &event); errUnmarshal != nil {
+			return true
 		}
-		if strings.HasPrefix(line, "data: ") {
-			var probe map[string]json.RawMessage
-			if errUnmarshal := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &probe); errUnmarshal == nil {
-				// Control events with no content yet.
-				if len(probe) == 1 {
-					if _, onlyType := probe["type"]; onlyType {
-						continue
+		if eventHasContent(event) {
+			return true
+		}
+	}
+	// Non-SSE payloads (or SSE without data lines) are forwarded as content.
+	return !sawData
+}
+
+func eventHasContent(event map[string]json.RawMessage) bool {
+	// OpenAI chat: choices[].delta with anything beyond role.
+	if rawChoices, ok := event["choices"]; ok {
+		var choices []map[string]json.RawMessage
+		if errUnmarshal := json.Unmarshal(rawChoices, &choices); errUnmarshal == nil {
+			for _, choice := range choices {
+				if rawDelta, okDelta := choice["delta"]; okDelta {
+					var delta map[string]json.RawMessage
+					if errUnmarshal := json.Unmarshal(rawDelta, &delta); errUnmarshal == nil {
+						for key := range delta {
+							if key != "role" {
+								return true
+							}
+						}
 					}
+				}
+				if rawMessage, okMessage := choice["message"]; okMessage && len(rawMessage) > 2 {
+					return true
 				}
 			}
 		}
-		meaningful = true
 	}
-	return meaningful
+	// OpenAI Responses and Claude deltas.
+	if rawDelta, ok := event["delta"]; ok {
+		var deltaText string
+		if errUnmarshal := json.Unmarshal(rawDelta, &deltaText); errUnmarshal == nil {
+			if strings.TrimSpace(deltaText) != "" {
+				return true
+			}
+		} else {
+			var deltaObject map[string]json.RawMessage
+			if errUnmarshal := json.Unmarshal(rawDelta, &deltaObject); errUnmarshal == nil {
+				if objectHasContent(deltaObject) {
+					return true
+				}
+			} else {
+				return true
+			}
+		}
+	}
+	if objectHasContent(event) {
+		return true
+	}
+	// Responses tool/answer items.
+	if rawOutput, ok := event["output"]; ok {
+		var output []json.RawMessage
+		if errUnmarshal := json.Unmarshal(rawOutput, &output); errUnmarshal == nil && len(output) > 0 {
+			return true
+		}
+	}
+	if rawItem, ok := event["item"]; ok && len(rawItem) > 2 {
+		return true
+	}
+	return false
+}
+
+// objectHasContent looks for non-empty content-bearing fields one level deep.
+func objectHasContent(object map[string]json.RawMessage) bool {
+	for _, key := range []string{"text", "arguments", "partial_json", "input_json_delta", "reasoning_content", "content"} {
+		raw, ok := object[key]
+		if !ok {
+			continue
+		}
+		var asText string
+		if errUnmarshal := json.Unmarshal(raw, &asText); errUnmarshal == nil {
+			if strings.TrimSpace(asText) != "" {
+				return true
+			}
+			continue
+		}
+		var asList []json.RawMessage
+		if errUnmarshal := json.Unmarshal(raw, &asList); errUnmarshal == nil {
+			if len(asList) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
