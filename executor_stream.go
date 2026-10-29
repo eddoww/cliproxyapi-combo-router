@@ -134,7 +134,7 @@ func runComboStream(req rpcExecutorRequest, pluginStreamID string) (int, error) 
 		}
 		lastErr = outcome.err
 		lastStatus = outcome.status
-		if outcome.status != 0 && !retryableStatus(outcome.status) {
+		if !retryableError(outcome.err, outcome.status) {
 			return outcome.status, outcome.err
 		}
 	}
@@ -206,7 +206,8 @@ func streamMember(hostCallbackID, pluginStreamID, format, member string, body []
 		if errRead != nil {
 			status := statusOf(errRead)
 			if !committed {
-				return streamOutcome{terminal: status != 0 && !retryableStatus(status), status: status, err: fmt.Errorf("%s: %w", member, errRead)}
+				errReadWrapped := fmt.Errorf("%s: %w", member, errRead)
+				return streamOutcome{terminal: !retryableError(errReadWrapped, status), status: status, err: errReadWrapped}
 			}
 			return streamOutcome{committed: true, terminal: true, status: status, err: fmt.Errorf("%s: %w", member, errRead)}
 		}
