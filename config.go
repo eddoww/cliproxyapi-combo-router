@@ -8,7 +8,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const pluginVersion = "0.1.0"
+const pluginVersion = "0.1.2"
 
 const (
 	strategyFallback   = "fallback"
